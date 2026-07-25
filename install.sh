@@ -17,6 +17,15 @@ VENV_DIR="${HERMES_HOME}/venv"
 BIN_DIR="${PREFIX}/bin"
 CORE_REPO="https://github.com/DevCoreXOfficial/core-termux"
 
+# ── Python versions (preference order) ──────────────────────────────
+# Hermes officially supports >=3.11,<3.14.  Termux currently ships 3.14
+# which works fine in practice, but we prefer 3.11–3.13 when available.
+# The official installer uses `uv` to manage Python — uv downloads
+# glibc-linked builds that CANNOT run on Android's Bionic libc.
+# We MUST use Termux's pkg-managed Python instead.
+# See: https://hermes-agent.nousresearch.com/docs/install  (Termux notes)
+declare -a PYTHON_CANDIDATES=("python3.11" "python3.12" "python3.13")
+
 # ── Colors ─────────────────────────────────────────────────────────
 R='\033[0;31m'; G='\033[0;32m'; Y='\033[0;33m'
 B='\033[0;34m'; C='\033[0;36m'; W='\033[1;37m'
@@ -111,8 +120,55 @@ ANDROID_API=$(getprop ro.build.version.sdk 2>/dev/null || echo "unknown")
 ANDROID_VER=$(getprop ro.build.version.release 2>/dev/null || echo "unknown")
 ok "Android ${ANDROID_VER} (API ${ANDROID_API})"
 
-PYTHON_VER=$(python3 --version 2>&1 | awk '{print $2}')
-ok "Python ${PYTHON_VER}"
+# ---- Python version detection ---------------------------------------
+# The official Hermes installer relies on `uv` to download and manage
+# Python.  `uv python install 3.11` downloads a glibc-linked build that
+# CANNOT run on Android's Bionic libc — this is the #1 reason the
+# official installer fails on native Termux.
+#
+# Our fix: use Termux's pkg-managed Python exclusively.
+#  1. Try to install a preferred version (3.11 → 3.12 → 3.13)
+#  2. If none available as a separate pkg, use the default `python3`
+#  3. Patch Hermes's requires-python constraint if it doesn't cover
+#     the Python version we're running on
+
+PYTHON_BIN=""
+PYTHON_PKG=""
+PYTHON_VER=""
+
+# First, check if any preferred version is already available
+for candidate in "${PYTHON_CANDIDATES[@]}"; do
+  if command -v "$candidate" &>/dev/null; then
+    PYTHON_BIN="$candidate"
+    PYTHON_PKG="${candidate#python}"  # "3.11" → "", we already have it
+    PYTHON_VER=$("$PYTHON_BIN" --version 2>&1 | awk '{print $2}')
+    ok "Python ${PYTHON_VER} found: ${PYTHON_BIN}"
+    break
+  fi
+done
+
+# If not found, try to install via pkg
+if [[ -z "$PYTHON_BIN" ]]; then
+  for candidate in "${PYTHON_CANDIDATES[@]}"; do
+    step "Checking if ${candidate} is available in Termux repos..."
+    if pkg install -y -q "$candidate" 2>/dev/null; then
+      PYTHON_BIN="$candidate"
+      PYTHON_PKG="$candidate"
+      PYTHON_VER=$("$PYTHON_BIN" --version 2>&1 | awk '{print $2}')
+      ok "${candidate} installed (Python ${PYTHON_VER})"
+      break
+    fi
+  done
+fi
+
+# Fallback to default python3 (Termux default: 3.14)
+if [[ -z "$PYTHON_BIN" ]]; then
+  PYTHON_BIN="python3"
+  PYTHON_PKG="python"
+  PYTHON_VER=$(python3 --version 2>&1 | awk '{print $2}')
+  info "Preferred Python versions not available in Termux repos"
+  info "Using default ${PYTHON_BIN} (Python ${PYTHON_VER})"
+fi
 
 # Check if Hermes already installed
 if command -v hermes &>/dev/null; then
@@ -189,28 +245,36 @@ HERMES_VERSION=$(grep '^version = ' pyproject.toml | head -1 | cut -d'"' -f2)
 ok "Hermes Agent ${HERMES_VERSION}"
 
 # ═══════════════════════════════════════════════════════════════════
-#   STEP 4 — Python Virtual Environment
+#   STEP 4 — Python Virtual Environment (Termux-native, no uv!)
 # ═══════════════════════════════════════════════════════════════════
-banner "Step 4 of 8 — Setting Up Python Environment"
+banner "Step 4 of 8 — Setting Up Python ${PYTHON_VER} Environment"
 
-# Patch pyproject.toml to allow current Python version
-PY_MAJOR=$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
-PY_MINOR=$(python3 -c 'import sys; print(sys.version_info.minor)')
+# Hermes's pyproject.toml constrains Python to >=3.11,<3.14.
+# If we're running on 3.14+ (Termux default as of 2026), the constraint
+# will block the editable install.  We patch it to allow the current
+# Python — this is safe because Hermes works on 3.14 in practice.
+PY_MAJOR=$(echo "$PYTHON_VER" | cut -d. -f1)
+PY_MINOR=$(echo "$PYTHON_VER" | cut -d. -f2)
 
-step "Patching Python constraint in pyproject.toml..."
-sed -i "s/requires-python = \">=3.11,<3.14\"/requires-python = \">=3.11,<=${PY_MAJOR}\"/" pyproject.toml
-ok "Python constraint relaxed for ${PY_MAJOR}"
+# Check if patching is needed
+HERMES_PY_REQ=$(grep 'requires-python' pyproject.toml | grep -oP '">=\K[^"]+')
+if [[ -n "$HERMES_PY_REQ" && "$HERMES_PY_REQ" != *"${PY_MAJOR}.${PY_MINOR}"* ]]; then
+  step "Patching requires-python in pyproject.toml (${HERMES_PY_REQ} → ${PY_MAJOR}.${PY_MINOR})..."
+  sed -i "s/requires-python = \">=3.11,<3.14\"/requires-python = \">=3.11,<=${PY_MAJOR}.${PY_MINOR}\"/" pyproject.toml
+  ok "Python constraint relaxed for ${PY_MAJOR}.${PY_MINOR}"
+else
+  ok "Python constraint already covers ${PY_MAJOR}.${PY_MINOR}"
+fi
 
-# Create venv
+# Create venv — using Termux's Python, NOT uv
 if [[ -d "${VENV_DIR}" ]]; then
   ok "Virtual environment already exists at ${VENV_DIR}"
-  # Update pip in existing venv
   step "Upgrading pip..."
   "${VENV_DIR}/bin/python" -m pip install --upgrade pip -q
 else
-  step "Creating virtual environment..."
-  python3 -m venv "${VENV_DIR}"
-  ok "Virtual environment created"
+  step "Creating virtual environment with ${PYTHON_BIN}..."
+  "${PYTHON_BIN}" -m venv "${VENV_DIR}"
+  ok "Virtual environment created (${PYTHON_VER})"
   step "Upgrading pip..."
   "${VENV_DIR}/bin/pip" install --upgrade pip -q
 fi

@@ -70,15 +70,28 @@ System-wide commands:
 
 ## How it works
 
-1. **Checks environment** — verifies Termux, Android API, architecture
-2. **Installs system deps** — git, Python, build tools, openssl
+The official Hermes installer uses `uv` to manage Python — `uv python install 3.11` downloads a **glibc-linked** Python binary that **cannot run** on Android's Bionic libc. This is the #1 reason the official installer fails on native Termux.
+
+**Our fix: use Termux's `pkg`-managed Python instead.**
+
+1. **Python detection** — tries preferred versions first (`python3.11` → `python3.12` → `python3.13`), falls back to Termux default (currently 3.14)
+2. **Installs system deps** — git, Python, build tools, openssl via `pkg` (no `uv`)
 3. **Clones Hermes** — full git repo at `~/.hermes/hermes-agent/`
-4. **Creates venv** — isolated Python environment
-5. **Patches Python constraint** — allows current Python version
+4. **Patches `requires-python`** — relaxes Hermes's `<3.14` constraint for 3.14+ if needed
+5. **Creates venv** — using Termux's Python (Bionic-native), NOT `uv`
 6. **Editable install** — `pip install -e` so `hermes update` works
 7. **Configures Hermes** — `hermes setup`, `hermes doctor --fix`
 8. **Optional: core-termux** — DevCoreX CLI framework
 9. **Verification** — checks `hermes`, `hermes update`, `hermes doctor`
+
+## Why not `uv`?
+
+| | `uv` (official) | `pkg` (this installer) |
+|---|---|---|
+| Python binary | glibc-linked | **Bionic-native** ✅ |
+| Runs on Termux | ❌ No | ✅ Yes |
+| Python version | Pinned 3.11 | Auto-detected |
+| External dep | Rust binary needs glibc | None — uses Termux's pkg
 
 ## CI / Headless Install
 
